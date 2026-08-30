@@ -9,11 +9,13 @@ using GameInterface.Services.ObjectManager;
 using Serilog;
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using TaleWorlds.CampaignSystem;
 using TaleWorlds.CampaignSystem.Actions;
 using TaleWorlds.CampaignSystem.Map;
 using TaleWorlds.CampaignSystem.Party;
 using TaleWorlds.CampaignSystem.Settlements;
+using TaleWorlds.Library;
 
 namespace GameInterface.Services.Armies.Handlers;
 
@@ -129,19 +131,78 @@ public class ArmyHandler : IHandler
         var data = payload.What;
         GameThread.RunSafe(() =>
         {
-        if (objectManager.TryGetObjectWithLogging(data.MobilePartyId, out MobileParty mobileParty) == false) return;
-        if (objectManager.TryGetObjectWithLogging<Army>(data.ArmyId, out var army) == false) return;
-        MobileParty clientMobileParty = null;
-        if (!string.IsNullOrEmpty(data.ClientMobilePartyId))
-        {
-            objectManager.TryGetObjectWithLogging(data.ClientMobilePartyId, out clientMobileParty);
-        }
-        ArmyPatches.RemoveMobilePartyInArmy(mobileParty, army, clientMobileParty);
-        if (ModInformation.IsServer)
-        {
-            network.SendAll(new NetworkRemovePartyInArmy(data.ArmyId, data.MobilePartyId, data.ClientMobilePartyId));
-        }
+            if (!objectManager.TryGetObjectWithLogging(data.MobilePartyId, out MobileParty mobileParty))
+                return;
+
+            if (objectManager.TryGetObjectWithLogging<Army>(data.ArmyId, out var army))
+            {
+                MobileParty clientMobileParty = null;
+                if (!string.IsNullOrEmpty(data.ClientMobilePartyId))
+                    objectManager.TryGetObjectWithLogging(data.ClientMobilePartyId, out clientMobileParty);
+
+                ArmyPatches.RemoveMobilePartyInArmy(mobileParty, army, clientMobileParty);
+            }
+            else
+            {
+                DetachFromMissingArmy(mobileParty, data.ArmyId);
+            }
+
+            if (ModInformation.IsServer)
+                network.SendAll(new NetworkRemovePartyInArmy(data.ArmyId, data.MobilePartyId, data.ClientMobilePartyId));
         });
+    }
+
+    private void DetachFromMissingArmy(MobileParty mobileParty, string missingArmyId)
+    {
+        var currentArmy = mobileParty.Army;
+        var registeredArmy = GetRegisteredArmy(mobileParty);
+        if (registeredArmy != null)
+        {
+            using (new AllowedThread())
+            {
+                if (currentArmy != null && !ReferenceEquals(currentArmy, registeredArmy))
+                    currentArmy._parties.Remove(mobileParty);
+                mobileParty._army = registeredArmy;
+                if (!registeredArmy._parties.Contains(mobileParty))
+                    registeredArmy._parties.Add(mobileParty);
+            }
+
+            Logger.Warning(
+                "Ignored removal from missing army {ArmyId} for party {PartyId} because it belongs to another registered army",
+                missingArmyId,
+                mobileParty.StringId);
+            return;
+        }
+
+        using (new AllowedThread())
+        {
+            currentArmy?._parties.Remove(mobileParty);
+            mobileParty.AttachedTo = null;
+            mobileParty._army = null;
+            mobileParty.ArmyPositionAdder = Vec2.Zero;
+            if (mobileParty.Ai != null)
+                mobileParty.Ai.RethinkAtNextHourlyTick = true;
+            mobileParty.Party?.SetVisualAsDirty();
+        }
+
+        Logger.Warning(
+            "Detached party {PartyId} from missing army {ArmyId}",
+            mobileParty.StringId,
+            missingArmyId);
+    }
+
+    private Army GetRegisteredArmy(MobileParty mobileParty)
+    {
+        if (mobileParty.Army != null && objectManager.Contains(mobileParty.Army))
+            return mobileParty.Army;
+        if (mobileParty.AttachedTo == null)
+            return null;
+
+        return Campaign.Current?.Kingdoms
+            .SelectMany(kingdom => kingdom.Armies)
+            .FirstOrDefault(army =>
+                objectManager.Contains(army) &&
+                ReferenceEquals(army.LeaderParty, mobileParty.AttachedTo));
     }
 
     private void HandleArmyAiBehaviorObjectChanged(MessagePayload<ArmyAiBehaviorObjectChanged> payload)

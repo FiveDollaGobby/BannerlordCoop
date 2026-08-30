@@ -2,6 +2,7 @@
 using GameInterface.Registry.Auto;
 using GameInterface.Services.Armies;
 using GameInterface.Services.MobileParties.Extensions;
+using GameInterface.Services.MobileParties.Messages.Behavior;
 using GameInterface.Services.MapEvents.Messages.Leave;
 using GameInterface.Services.ObjectManager;
 using GameInterface.Services.Players;
@@ -15,6 +16,7 @@ using TaleWorlds.CampaignSystem.Actions;
 using TaleWorlds.CampaignSystem.MapEvents;
 using TaleWorlds.CampaignSystem.Party;
 using TaleWorlds.CampaignSystem.Settlements;
+using TaleWorlds.Library;
 
 namespace GameInterface.Services.MapEvents;
 
@@ -60,33 +62,31 @@ internal sealed class MapEventLoadCleaner : IMapEventLoadCleaner
                 .Where(party => party.IsMobile && party.MobileParty.IsActive)
                 .Select(party => party.MobileParty)
                 .ToArray();
-            var playerLedArmies = involvedMobileParties
-                .Select(mobileParty => mobileParty.Army)
-                .Where(army => army != null && army.LeaderParty.IsPlayerParty())
-                .Distinct()
-                .ToArray();
-            var releasedArmyParties = playerLedArmies
-                .SelectMany(army => army.Parties)
-                .Where(mobileParty => mobileParty.IsActive && !mobileParty.IsPlayerParty())
-                .Distinct()
-                .ToArray();
+            var playerLedArmies = GetPlayerLedArmies(involvedMobileParties);
 
             FinalizeOrRepairEvent(mapEvent);
 
+            var releasedArmyParties = new List<MobileParty>();
             foreach (var army in playerLedArmies)
             {
                 logger.Information(
                     "Dispersing loaded player-led army {ArmyName} released from map event {MapEventId}",
                     army.Name,
                     mapEvent.StringId);
-                armyDisbander.Disband(army, Army.ArmyDispersionReason.Unknown);
+                releasedArmyParties.AddRange(
+                    armyDisbander.Disband(army, Army.ArmyDispersionReason.Unknown));
             }
 
             foreach (var mobileParty in involvedMobileParties.Concat(releasedArmyParties).Distinct())
             {
                 if (!mobileParty.IsActive || mobileParty.IsPlayerParty())
                     continue;
+                if (IsInPreservedArmy(mobileParty))
+                    continue;
 
+                mobileParty.ArmyPositionAdder = Vec2.Zero;
+                mobileParty.SetMoveModeHold();
+                mobileParty.ResetNavigationToHold();
                 if (releasedArmyParties.Contains(mobileParty) &&
                     TrySetReleasedPartySettlementObjective(mobileParty, out var settlement))
                 {
@@ -95,12 +95,51 @@ internal sealed class MapEventLoadCleaner : IMapEventLoadCleaner
                         mobileParty.StringId,
                         settlement.StringId,
                         mapEvent.StringId);
+                    messageBroker.Publish(
+                        this,
+                        new PartyBehaviorChangeAttempted(mobileParty));
                     continue;
                 }
 
-                mobileParty.ResetNavigationToHold();
+                messageBroker.Publish(
+                    this,
+                    new PartyBehaviorChangeAttempted(
+                        mobileParty,
+                        resetMovementToHold: true));
             }
         }
+    }
+
+    private static bool IsInPreservedArmy(MobileParty mobileParty)
+    {
+        if (mobileParty.Army != null)
+            return true;
+        if (mobileParty.AttachedTo == null)
+            return false;
+
+        return Campaign.Current.Kingdoms
+            .SelectMany(kingdom => kingdom.Armies)
+            .Any(army => ReferenceEquals(army.LeaderParty, mobileParty.AttachedTo));
+    }
+
+    private static Army[] GetPlayerLedArmies(MobileParty[] involvedMobileParties)
+    {
+        var involvedParties = new HashSet<MobileParty>(involvedMobileParties);
+        var armies = Campaign.Current.Kingdoms
+            .SelectMany(kingdom => kingdom.Armies)
+            .Concat(involvedMobileParties.Select(mobileParty => mobileParty.Army))
+            .Where(army => army != null)
+            .Distinct();
+
+        return armies
+            .Where(army =>
+                army.LeaderParty?.IsPlayerParty() == true &&
+                (involvedParties.Contains(army.LeaderParty) ||
+                 army.Parties.Any(involvedParties.Contains) ||
+                 involvedMobileParties.Any(mobileParty =>
+                     ReferenceEquals(mobileParty.Army, army) ||
+                     ReferenceEquals(mobileParty.AttachedTo, army.LeaderParty))))
+            .ToArray();
     }
 
     private void RepairPartySideLinks(MapEvent mapEvent)

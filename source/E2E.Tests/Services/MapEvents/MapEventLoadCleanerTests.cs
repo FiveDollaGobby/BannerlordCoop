@@ -7,6 +7,7 @@ using TaleWorlds.CampaignSystem;
 using TaleWorlds.CampaignSystem.MapEvents;
 using TaleWorlds.CampaignSystem.Party;
 using TaleWorlds.CampaignSystem.Settlements;
+using TaleWorlds.Library;
 using Xunit.Abstractions;
 
 namespace E2E.Tests.Services.MapEvents;
@@ -337,6 +338,69 @@ public class MapEventLoadCleanerTests : MapEventTestBase
     }
 
     [Fact]
+    public void FinalizePlayerMapEvents_RepairsOrphanArmyMembersAndCanRunTwice()
+    {
+        var mapEventContext = CreateServerMapEvent();
+        var heroId = TestEnvironment.CreateRegisteredObject<Hero>();
+        RegisterAsPlayerParty("loaded-player-orphan-army", heroId, mapEventContext.AttackerPartyId);
+        string? armyId = null;
+        string? armyOnlyFollowerId = null;
+        string? attachedOnlyFollowerId = null;
+
+        Server.Call(() =>
+        {
+            Assert.True(Server.ObjectManager.TryGetObject<MobileParty>(
+                mapEventContext.AttackerPartyId,
+                out var attacker));
+            var kingdom = GameObjectCreator.CreateInitializedObject<Kingdom>();
+            var army = new Army(kingdom, attacker, Army.ArmyTypes.Raider);
+            var armyOnlyFollower = GameObjectCreator.CreateInitializedObject<MobileParty>();
+            var attachedOnlyFollower = GameObjectCreator.CreateInitializedObject<MobileParty>();
+
+            armyOnlyFollower._army = army;
+            armyOnlyFollower.ArmyPositionAdder = new Vec2(3f, 4f);
+            armyOnlyFollower._defaultBehavior = AiBehavior.EscortParty;
+            armyOnlyFollower.ShortTermBehavior = AiBehavior.EscortParty;
+            armyOnlyFollower.TargetParty = attacker;
+            armyOnlyFollower.MoveTargetParty = attacker;
+            armyOnlyFollower.PartyMoveMode = MoveModeType.Party;
+            armyOnlyFollower.Ai.AiBehaviorInteractable = attacker.Party;
+
+            attachedOnlyFollower.AttachedTo = attacker;
+            attachedOnlyFollower.ArmyPositionAdder = new Vec2(5f, 6f);
+
+            Assert.DoesNotContain(armyOnlyFollower, army._parties);
+            Assert.Null(attachedOnlyFollower.Army);
+            Assert.DoesNotContain(attachedOnlyFollower, army._parties);
+            Assert.True(Server.ObjectManager.TryGetId(army, out armyId));
+            Assert.True(Server.ObjectManager.TryGetId(armyOnlyFollower, out armyOnlyFollowerId));
+            Assert.True(Server.ObjectManager.TryGetId(attachedOnlyFollower, out attachedOnlyFollowerId));
+
+            var cleaner = Server.Resolve<IMapEventLoadCleaner>();
+            cleaner.FinalizePlayerMapEvents();
+            cleaner.FinalizePlayerMapEvents();
+            TestEnvironment.FlushCoalescer();
+
+            Assert.False(Server.ObjectManager.TryGetObject<Army>(armyId, out _));
+            AssertReleasedWithValidBehavior(armyOnlyFollower);
+            AssertReleasedWithValidBehavior(attachedOnlyFollower);
+        }, MapEventDisabledMethods);
+
+        foreach (var client in Clients)
+        {
+            Assert.False(client.ObjectManager.TryGetObject<Army>(armyId, out _));
+            Assert.True(client.ObjectManager.TryGetObject<MobileParty>(
+                armyOnlyFollowerId,
+                out var armyOnlyFollower));
+            Assert.True(client.ObjectManager.TryGetObject<MobileParty>(
+                attachedOnlyFollowerId,
+                out var attachedOnlyFollower));
+            AssertReleasedWithValidBehavior(armyOnlyFollower);
+            AssertReleasedWithValidBehavior(attachedOnlyFollower);
+        }
+    }
+
+    [Fact]
     public void FinalizePlayerMapEvents_PlayerFollowerInAiLedArmy_PreservesArmy()
     {
         var mapEventContext = CreateServerMapEvent();
@@ -347,11 +411,15 @@ public class MapEventLoadCleanerTests : MapEventTestBase
         {
             Assert.True(Server.ObjectManager.TryGetObject<MapEvent>(mapEventContext.MapEventId, out var mapEvent));
             Assert.True(Server.ObjectManager.TryGetObject<MobileParty>(mapEventContext.AttackerPartyId, out var armyLeader));
+            Assert.True(Server.ObjectManager.TryGetObject<MobileParty>(mapEventContext.DefenderPartyId, out var attachedOnlyFollower));
             Assert.True(Server.ObjectManager.TryGetObject<MobileParty>(playerPartyId, out var playerFollower));
             var kingdom = GameObjectCreator.CreateInitializedObject<Kingdom>();
             var army = new Army(kingdom, armyLeader, Army.ArmyTypes.Raider);
             playerFollower.Army = army;
             playerFollower.AttachedTo = armyLeader;
+            armyLeader.ArmyPositionAdder = new Vec2(7f, 8f);
+            attachedOnlyFollower.AttachedTo = armyLeader;
+            attachedOnlyFollower.ArmyPositionAdder = new Vec2(9f, 10f);
             Assert.True(Server.ObjectManager.TryGetId(army, out armyId));
             Assert.Same(mapEvent, playerFollower.MapEvent);
 
@@ -361,6 +429,10 @@ public class MapEventLoadCleanerTests : MapEventTestBase
             Assert.True(Server.ObjectManager.TryGetObject<Army>(armyId, out _));
             Assert.Same(army, playerFollower.Army);
             Assert.Same(armyLeader, playerFollower.AttachedTo);
+            Assert.Equal(new Vec2(7f, 8f), armyLeader.ArmyPositionAdder);
+            Assert.Null(attachedOnlyFollower.Army);
+            Assert.Same(armyLeader, attachedOnlyFollower.AttachedTo);
+            Assert.Equal(new Vec2(9f, 10f), attachedOnlyFollower.ArmyPositionAdder);
         }, MapEventDisabledMethods);
 
         foreach (var client in Clients)
@@ -396,5 +468,25 @@ public class MapEventLoadCleanerTests : MapEventTestBase
         {
             Assert.True(client.ObjectManager.TryGetObject<MapEvent>(mapEventContext.MapEventId, out _));
         }
+    }
+
+    private static void AssertReleasedWithValidBehavior(MobileParty party)
+    {
+        Assert.Null(party.Army);
+        Assert.Null(party.AttachedTo);
+        Assert.Equal(Vec2.Zero, party.ArmyPositionAdder);
+        Assert.Null(party.TargetParty);
+        Assert.Null(party.MoveTargetParty);
+
+        if (party.DefaultBehavior == AiBehavior.GoToSettlement)
+        {
+            Assert.NotNull(party.TargetSettlement);
+            return;
+        }
+
+        Assert.Equal(AiBehavior.Hold, party.DefaultBehavior);
+        Assert.Equal(AiBehavior.Hold, party.ShortTermBehavior);
+        Assert.Null(party.Ai.AiBehaviorInteractable);
+        Assert.Equal(MoveModeType.Hold, party.PartyMoveMode);
     }
 }

@@ -5,6 +5,7 @@ using GameInterface.Services.ObjectManager;
 using HarmonyLib;
 using SandBox.GauntletUI;
 using Serilog;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
@@ -64,7 +65,7 @@ internal class ArmyRegistry : AutoRegistryBase<Army>
     // Just clean up the fields directly.
     public override void OnClientDestroyed(Army obj, string id)
     {
-        GameThread.Run(() =>
+        GameThread.RunSafe(() =>
         {
             using (new AllowedThread())
             {
@@ -74,18 +75,34 @@ internal class ArmyRegistry : AutoRegistryBase<Army>
                 }
                 CampaignEventDispatcher.Instance.OnArmyDispersed(obj, Army.ArmyDispersionReason.Unknown, obj.Parties.Contains(MobileParty.MainParty));
                 obj._armyIsDispersing = true;
-                foreach (var party in obj._parties)
+                var campaignParties = Campaign.Current?.CampaignObjectManager?.MobileParties ??
+                    Enumerable.Empty<MobileParty>();
+                var parties = obj._parties
+                    .Concat(campaignParties.Where(party =>
+                        party != null &&
+                        (ReferenceEquals(party.Army, obj) ||
+                         (party.Army == null &&
+                          ReferenceEquals(party.AttachedTo, obj.LeaderParty)))))
+                    .Where(party => party != null)
+                    .Distinct()
+                    .ToArray();
+
+                foreach (var party in parties)
                 {
-                    if (MobileParty.MainParty != null)
+                    if (party.Army != null && !ReferenceEquals(party.Army, obj))
+                        continue;
+
+                    if (MobileParty.MainParty != null && party.Party != null)
                     {
                         party.Party.UpdateVisibilityAndInspected(MobileParty.MainParty.Position, 0f);
                     }
-                    if (MobileParty.MainParty != party)
+                    if (MobileParty.MainParty != party && party.Ai != null)
                     {
                         party.Ai.RethinkAtNextHourlyTick = true;
                     }
                     party.AttachedTo = null;
                     party._army = null;
+                    party.ArmyPositionAdder = Vec2.Zero;
                 }
                 obj._parties.Clear();
                 obj.Kingdom = null;
