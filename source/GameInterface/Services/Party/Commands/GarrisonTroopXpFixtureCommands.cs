@@ -4,6 +4,7 @@ using Common.Messaging;
 using GameInterface.Services.MobileParties.Messages.Behavior;
 using GameInterface.Services.ObjectManager;
 using GameInterface.Services.Players;
+using GameInterface.Services.Settlements.Messages;
 using Helpers;
 using Newtonsoft.Json;
 using SandBox.GauntletUI;
@@ -276,6 +277,59 @@ internal static class GarrisonTroopXpFixtureCommands
 
         PartyScreenHelper.OpenScreenAsManageTroops(garrison);
         return "GARRISON_XP_FIXTURE_SCREEN_OPENED";
+    }
+
+    [CommandLineArgumentFunction("request_missing_garrison_fixture", "coop.debug.mobileparty")]
+    public static string RequestMissingGarrison(List<string> args)
+    {
+        const string usage = "Usage: coop.debug.mobileparty.request_missing_garrison_fixture";
+        if (!ModInformation.IsClient) return "Command can only be run on a client.";
+        if (args.Count != 0) return usage;
+
+        var settlement = Settlement.Find(SettlementId);
+        if (settlement?.Town == null) return "Danustica was not found.";
+        if (Hero.MainHero?.CurrentSettlement != settlement)
+            return "The local player is not in Danustica.";
+        if (settlement.OwnerClan != Hero.MainHero.Clan)
+            return "Danustica does not belong to the local player's clan.";
+
+        if (settlement.Town.GarrisonParty != null)
+            return GarrisonCreationState(settlement);
+
+        MessageBroker.Instance.Publish(
+            typeof(GarrisonTroopXpFixtureCommands),
+            new NewGarrisonParty(settlement));
+        return "GARRISON_FIXTURE_CREATION_REQUESTED";
+    }
+
+    [CommandLineArgumentFunction("missing_garrison_fixture_state", "coop.debug.mobileparty")]
+    public static string MissingGarrisonState(List<string> args)
+    {
+        const string usage = "Usage: coop.debug.mobileparty.missing_garrison_fixture_state";
+        if (args.Count != 0) return usage;
+
+        var settlement = Settlement.Find(SettlementId);
+        if (settlement?.Town == null) return "Danustica was not found.";
+        return GarrisonCreationState(settlement);
+    }
+
+    private static string GarrisonCreationState(Settlement settlement)
+    {
+        var garrison = settlement.Town.GarrisonParty;
+        string garrisonPartyId = null;
+        bool registered = garrison != null &&
+            TryGetObjectManager(out var objectManager) &&
+            objectManager.TryGetId(garrison, out garrisonPartyId);
+
+        return JsonResult(new
+        {
+            role = ModInformation.IsServer ? "server" : "client",
+            settlementId = SettlementId,
+            settlementName = settlement.Name.ToString(),
+            garrisonExists = garrison != null,
+            garrisonRegistered = registered,
+            garrisonPartyId
+        });
     }
 
     [CommandLineArgumentFunction("garrison_xp_fixture_screen_state", "coop.debug.mobileparty")]

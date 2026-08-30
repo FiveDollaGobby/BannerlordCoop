@@ -3,8 +3,10 @@ using Common.Logging;
 using Common.Messaging;
 using Common.Network;
 using GameInterface.Services.ObjectManager;
+using GameInterface.Services.Players;
 using GameInterface.Services.Settlements.Messages;
 using GameInterface.Services.Settlements.Patches;
+using LiteNetLib;
 using Serilog;
 using System;
 using TaleWorlds.CampaignSystem;
@@ -23,12 +25,18 @@ public class SettlementHandler : IHandler
     private readonly IMessageBroker messageBroker;
     private readonly IObjectManager objectManager;
     private readonly INetwork network;
+    private readonly IPlayerManager playerManager;
 
-    public SettlementHandler(IMessageBroker messageBroker, INetwork network, IObjectManager objectManager)
+    public SettlementHandler(
+        IMessageBroker messageBroker,
+        INetwork network,
+        IObjectManager objectManager,
+        IPlayerManager playerManager)
     {
         this.messageBroker = messageBroker;
         this.network = network;
         this.objectManager = objectManager;
+        this.playerManager = playerManager;
 
         messageBroker.Subscribe<ChangeSettlementBribePaid>(HandleBribePaid);
         messageBroker.Subscribe<ChangeSettlementHitPoints>(HandleHitPoints);
@@ -289,8 +297,31 @@ public class SettlementHandler : IHandler
     {
         GameThread.RunSafe(() =>
         {
+            if (!ModInformation.IsServer) return;
             if (!objectManager.TryGetObjectWithLogging<Settlement>(payload.What.SettlementId, out var settlement)) return;
-            if (settlement.Town.GarrisonParty != null) return;
+            if (!(payload.Who is NetPeer peer) ||
+                !playerManager.TryGetPlayer(peer, out var player) ||
+                !objectManager.TryGetObjectWithLogging<Hero>(player.HeroId, out var playerHero) ||
+                playerHero.PartyBelongedTo?.CurrentSettlement != settlement ||
+                !ReferenceEquals(playerHero.Clan, settlement.OwnerClan))
+            {
+                Logger.Warning(
+                    "Ignored missing garrison request for {SettlementId} because the player is not its owner or is no longer there",
+                    payload.What.SettlementId);
+                return;
+            }
+
+            if (settlement.Town.GarrisonParty != null)
+            {
+                Logger.Information(
+                    "Garrison already exists for {SettlementId}",
+                    payload.What.SettlementId);
+                return;
+            }
+
+            Logger.Information(
+                "Creating missing garrison for {SettlementId}",
+                payload.What.SettlementId);
             settlement.AddGarrisonParty();
         });
     }

@@ -5,6 +5,8 @@ using GameInterface.Services.Settlements.Messages;
 using HarmonyLib;
 using Helpers;
 using Serilog;
+using System;
+using System.Collections.Generic;
 using TaleWorlds.CampaignSystem;
 using TaleWorlds.CampaignSystem.CampaignBehaviors;
 using TaleWorlds.CampaignSystem.GameMenus;
@@ -16,7 +18,11 @@ namespace GameInterface.Services.Settlements.Patches.Disable;
 [HarmonyPatch(typeof(PlayerTownVisitCampaignBehavior))]
 internal class DisablePlayerTownVisitCampaignBehavior
 {
+    private const int MaxGarrisonReadyChecks = 300;
     private static readonly ILogger Logger = LogManager.GetLogger<DisablePlayerTownVisitCampaignBehavior>();
+    private static readonly Dictionary<string, DateTime> PendingGarrisonRequests = new Dictionary<string, DateTime>();
+    private static readonly HashSet<string> WaitingForGarrison = new HashSet<string>();
+
     /// <summary>
     /// Disables entering the arena from the town menu
     /// </summary>
@@ -167,10 +173,35 @@ internal class DisablePlayerTownVisitCampaignBehavior
             PartyScreenHelper.OpenScreenAsManageTroops(currentSettlement.Town.GarrisonParty);
             return false;
         }
-        MessageBroker.Instance.Publish(__instance, new NewGarrisonParty(currentSettlement));
-        CheckGarrisonReady(currentSettlement, isDonate: false);
+        RequestGarrison(__instance, currentSettlement);
+        WaitForGarrison(currentSettlement, isDonate: false);
         return false;
     }
+
+    [HarmonyPatch("game_menu_manage_garrison_on_condition")]
+    [HarmonyPostfix]
+    private static void ManageGarrisonConditionPostfix(PlayerTownVisitCampaignBehavior __instance)
+    {
+        if (!ModInformation.IsClient)
+            return;
+
+        var mainHero = Hero.MainHero;
+        var settlement = mainHero?.CurrentSettlement;
+        if (settlement?.Town == null)
+            return;
+
+        if (settlement.Town.GarrisonParty != null)
+        {
+            PendingGarrisonRequests.Remove(settlement.StringId);
+            return;
+        }
+
+        if (!ReferenceEquals(settlement.OwnerClan, mainHero.Clan))
+            return;
+
+        RequestGarrison(__instance, settlement);
+    }
+
     [HarmonyPatch(nameof(PlayerTownVisitCampaignBehavior.game_menu_leave_troops_garrison_on_consequece))]
     [HarmonyPrefix]
     private static bool Prefixx(PlayerTownVisitCampaignBehavior __instance)
@@ -181,21 +212,60 @@ internal class DisablePlayerTownVisitCampaignBehavior
             PartyScreenHelper.OpenScreenAsDonateGarrisonWithCurrentSettlement();
             return false;
         }
-        MessageBroker.Instance.Publish(__instance, new NewGarrisonParty(currentSettlement));
-        CheckGarrisonReady(currentSettlement, isDonate: true);
+        RequestGarrison(__instance, currentSettlement);
+        WaitForGarrison(currentSettlement, isDonate: true);
         return false;
     }
-    private static void CheckGarrisonReady(Settlement settlement, bool isDonate)
+
+    private static void RequestGarrison(PlayerTownVisitCampaignBehavior instance, Settlement settlement)
+    {
+        var now = DateTime.UtcNow;
+        if (PendingGarrisonRequests.TryGetValue(settlement.StringId, out var retryAt) &&
+            retryAt > now)
+        {
+            return;
+        }
+
+        PendingGarrisonRequests[settlement.StringId] = now.AddSeconds(5);
+        Logger.Information("Requesting missing garrison for {SettlementId}", settlement.StringId);
+        MessageBroker.Instance.Publish(instance, new NewGarrisonParty(settlement));
+    }
+
+    private static void WaitForGarrison(Settlement settlement, bool isDonate)
+    {
+        if (!WaitingForGarrison.Add(settlement.StringId))
+            return;
+
+        CheckGarrisonReady(settlement, isDonate, checks: 0);
+    }
+
+    private static void CheckGarrisonReady(Settlement settlement, bool isDonate, int checks)
     {
         if (settlement.Town.GarrisonParty != null)
         {
+            PendingGarrisonRequests.Remove(settlement.StringId);
+            WaitingForGarrison.Remove(settlement.StringId);
             if (isDonate)
                 PartyScreenHelper.OpenScreenAsDonateGarrisonWithCurrentSettlement();
             else
                 PartyScreenHelper.OpenScreenAsManageTroops(settlement.Town.GarrisonParty);
             return;
         }
-        GameThread.EnqueueSafe(() => CheckGarrisonReady(settlement, isDonate));
+
+        if (Hero.MainHero?.CurrentSettlement != settlement)
+        {
+            WaitingForGarrison.Remove(settlement.StringId);
+            return;
+        }
+
+        if (checks >= MaxGarrisonReadyChecks)
+        {
+            WaitingForGarrison.Remove(settlement.StringId);
+            Logger.Warning("Garrison for {SettlementId} was not created in time", settlement.StringId);
+            return;
+        }
+
+        GameThread.EnqueueSafe(() => CheckGarrisonReady(settlement, isDonate, checks + 1));
     }
     [HarmonyPatch(nameof(PlayerTownVisitCampaignBehavior.game_menu_town_on_init))]
     [HarmonyPrefix]
